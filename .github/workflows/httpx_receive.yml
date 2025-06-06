@@ -1,1 +1,244 @@
+name: Httpx Secondary Worker
 
+on:
+  workflow_dispatch:
+    inputs:
+      primary_github_server_url:
+        description: 'The server URL of the primary GitHub instance (e.g., https://github.com)'
+        required: true
+        type: string
+      primary_repo_owner:
+        description: 'The owner of the primary repository that triggered this workflow.'
+        required: true
+        type: string
+      primary_repo_name:
+        description: 'The name of the primary repository that triggered this workflow.'
+        required: true
+        type: string
+      primary_run_id:
+        description: 'The run ID of the workflow in the primary repository.'
+        required: true
+        type: string
+      chunk_package_artifact_name:
+        description: 'The name of the artifact package containing all chunks and resolvers.'
+        required: true
+        type: string
+      secondary_matrix_json:
+        description: 'The JSON string representing the matrix of chunks assigned to this secondary worker.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  SECONDARY_ACCOUNT_MAX_PARALLEL: 20
+
+jobs:
+  process_assigned_chunks_secondary:
+    name: Process Assigned Chunks (Secondary Account)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/pcoder7/spider-puredns-actions:latest
+      credentials:
+        username: pcoder7
+        password: ${{ secrets.GHCR_TOKEN }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        pair: ${{ fromJson(github.event.inputs.secondary_matrix_json && github.event.inputs.secondary_matrix_json || '[]') }}
+    steps:
+
+          
+      - name: Display Trigger Payload (Debug)
+        run: |
+          echo "SECONDARY WORKER: Received payload:"
+          echo "${{ toJson(github.event.inputs) }}"
+          echo "---"
+          echo "SECONDARY WORKER: My assigned matrix for this job instance:"
+          echo "${{ toJson(matrix.pair) }}"
+
+      - name: Checkout repository (Account 2's repo)
+        uses: actions/checkout@v3
+
+      - name: Download Full Chunks Package from Primary Account
+        env:
+          GH_TOKEN_PRIMARY_ACCOUNT_READ: ${{ secrets.PAT_FOR_PRIMARY_ACCOUNT_ARTIFACTS_READ }}
+          PRIMARY_REPO_OWNER: ${{ github.event.inputs.primary_repo_owner }}
+          PRIMARY_REPO_NAME: ${{ github.event.inputs.primary_repo_name }}
+          PRIMARY_RUN_ID: ${{ github.event.inputs.primary_run_id }}
+          ARTIFACT_NAME_FROM_PRIMARY: ${{ github.event.inputs.chunk_package_artifact_name }}
+        shell: bash
+        run: |
+          echo "SECONDARY WORKER: Downloading artifact '$ARTIFACT_NAME_FROM_PRIMARY' from $PRIMARY_REPO_OWNER/$PRIMARY_REPO_NAME, run ID $PRIMARY_RUN_ID"
+          if ! command -v gh &> /dev/null; then
+            echo "INFO: gh CLI not found. Installing..."
+            apt-get update -qy
+            apt-get install -qy curl
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            apt-get update -qy
+            apt-get install -qy gh
+            if ! command -v gh &> /dev/null; then
+              echo "ERROR: gh CLI installation failed."
+              exit 1
+            fi
+          fi
+
+          echo "$GH_TOKEN_PRIMARY_ACCOUNT_READ" | gh auth login --with-token
+          FULL_PRIMARY_REPO="$PRIMARY_REPO_OWNER/$PRIMARY_REPO_NAME"
+          gh run download "$PRIMARY_RUN_ID" -R "$FULL_PRIMARY_REPO" -n "$ARTIFACT_NAME_FROM_PRIMARY" --dir .
+
+          PACKAGE_FILENAME="$ARTIFACT_NAME_FROM_PRIMARY.tar.gz"
+          if [ ! -f "$PACKAGE_FILENAME" ]; then
+            echo "ERROR: Failed to download '$PACKAGE_FILENAME'."
+            exit 1
+          fi
+          echo "Downloaded '$PACKAGE_FILENAME'."
+    
+       
+      - name: Extract Chunks and Resolvers for Secondary
+        shell: bash
+        run: |
+          PACKAGE_FILENAME="${{ github.event.inputs.chunk_package_artifact_name }}.tar.gz"
+          echo "SECONDARY WORKER: Extracting $PACKAGE_FILENAME..."
+          tar -xzvf "$PACKAGE_FILENAME"
+          if [ ! -d "chunks" ] || [ ! -f "resolvers.txt" ]; then
+            echo "ERROR: 'chunks/' or 'resolvers.txt' missing after extraction."
+            exit 1
+          fi
+          echo "Extraction complete."
+          ls -R chunks/
+          ls resolvers.txt resolvers-trusted.txt
+      
+      - name: Set up Go & install httpx + dsieve
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23'
+     
+      - name: Install httpx and dsieve
+        run: |
+          if command -v dsieve &> /dev/null; then
+            echo "dsieve is already installed"
+          else
+            echo "Installing dsieve..."
+            go install github.com/trickest/dsieve@latest
+          fi
+
+      - name: Run httpx + pre-dsieve on subdomains + final filtering
+        shell: bash
+        run: |
+          DOMAIN=${{ matrix.pair.domain }}
+          CHUNK_FILE_PATH=${{ matrix.pair.chunk }}
+          echo "SECONDARY WORKER: Processing domain '$DOMAIN' with chunk '$CHUNK_FILE_PATH'..."
+
+          if [ ! -f "$CHUNK_FILE_PATH" ]; then
+            echo "ERROR: Chunk file '$CHUNK_FILE_PATH' not found!"
+            exit 1
+          fi
+
+          # Step A: pre-dsieve on raw subdomain chunk
+          echo "-> Generating parent_domains.txt from raw subdomains..."
+          dsieve -if "$CHUNK_FILE_PATH" -f 2 | sort -u > parent_domains.txt
+          echo "  Parent count: $(wc -l < parent_domains.txt)"
+          head -n 5 parent_domains.txt || true
+
+          # Step B: Probe with httpx
+          HTTPX_OUT="httpx_output.txt"
+          echo "-> Running httpx (100 threads) against '$CHUNK_FILE_PATH'..."
+          httpx \
+            -l "$CHUNK_FILE_PATH" \
+            -threads 200 \
+            -silent \
+            -no-color \
+            -o "$HTTPX_OUT"
+          if [ ! -s "$HTTPX_OUT" ]; then
+            echo "No live URLs found. Exiting."
+            exit 0
+          fi
+
+          # Step C: Extract host:port for debugging
+          cut -d'/' -f3 "$HTTPX_OUT" > hosts_with_port.txt
+          echo "  Sample hosts_with_port.txt:"
+          head -n 5 hosts_with_port.txt || true
+
+          # Step D: Filter per parent domain
+          OUTPUT_ROOT="results"
+          mkdir -p "$OUTPUT_ROOT"
+          while read -r parent; do
+            mkdir -p "$OUTPUT_ROOT/$parent"
+            awk -v b="$parent" -F'/' '
+              {
+                host = $3
+                sub(/:.*/, "", host)
+                if (host == b || host ~ ("\\." b "$")) {
+                  print $0
+                }
+              }
+            ' "$HTTPX_OUT" > "$OUTPUT_ROOT/$parent/httpx_result.txt"
+          done < parent_domains.txt
+          echo "-> Split complete for domain '$DOMAIN'."
+          mkdir -p results
+      
+      - name: Compute SAFE_CHUNK (no slashes)
+        run: |
+          SAFE_CHUNK="${{ matrix.pair.chunk }}"
+          SAFE_CHUNK="$(echo "$SAFE_CHUNK" | tr '/' '_')"
+          echo "SAFE_CHUNK=$SAFE_CHUNK" >> $GITHUB_ENV              
+
+      - name: Upload Secondary Account httpx+dsieve Results (as artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: secondary_httpx_dsieve_${{ matrix.pair.domain }}_${{ env.SAFE_CHUNK }}
+          path: results/
+          retention-days: 1
+
+  commit_all_secondary_results:
+    name: Commit All Secondary Results
+    needs: process_assigned_chunks_secondary
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (Account 2's repo)
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all 'secondary_httpx_dsieve_*' artifacts from this workflow run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: secondary_httpx_dsieve_*
+          path: temp_results
+
+      - name: Organize and Commit Results
+        shell: bash
+        run: |
+          echo "Organizing downloaded results..."
+          mkdir -p results
+
+          # Find every httpx_result.txt inside each downloaded artifact and copy to ./results/<parent>/
+          mkdir -p results
+          find temp_results -type f -name "httpx_result.txt" | while read -r filepath; do
+            parent="$(basename "$(dirname "$filepath")")"
+            mkdir -p "results/$parent"
+            cp "$filepath" "results/$parent/httpx_result.txt"
+          done || true
+
+          git config --global user.name "Account2 PureDNS Bot"
+          git config --global user.email "actions-bot@users.noreply.github.com"
+
+          if [ -d "results" ] && [ "$(ls -A results)" ]; then
+            git add results/
+            if ! git diff --staged --quiet; then
+              echo "Committing results..."
+              git commit -m "Add/Update httpx+dsieve results from Secondary Account (Run: ${{ github.event.inputs.primary_run_id || github.run_id }})"
+              git push
+            else
+              echo "No new changes in 'results/' to commit."
+            fi
+          else
+            echo "Results directory is empty or missing. Nothing to commit."
+          fi
