@@ -1,249 +1,325 @@
-name: Httpx Secondary Worker
-
 on:
   workflow_dispatch:
-    inputs:
-      primary_github_server_url:
-        description: 'The server URL of the primary GitHub instance (e.g., https://github.com)'
-        required: true
-        type: string
-      primary_repo_owner:
-        description: 'The owner of the primary repository that triggered this workflow.'
-        required: true
-        type: string
-      primary_repo_name:
-        description: 'The name of the primary repository that triggered this workflow.'
-        required: true
-        type: string
-      primary_run_id:
-        description: 'The run ID of the workflow in the primary repository.'
-        required: true
-        type: string
-      chunk_package_artifact_name:
-        description: 'The name of the artifact package containing all chunks and resolvers.'
-        required: true
-        type: string
-      secondary_matrix_json:
-        description: 'The JSON string representing the matrix of chunks assigned to this secondary worker.'
-        required: true
-        type: string
 
 permissions:
   contents: write
-  actions: read
 
 env:
-  SECONDARY_ACCOUNT_MAX_PARALLEL: 20
+  LINES_PER_CHUNK: 51000  # Number of lines per chunk
 
 jobs:
-  process_assigned_chunks_secondary:
-    name: Process Assigned Chunks (Secondary Account)
+  prepare_matrix:
+    name: Prepare chunk matrix
     runs-on: ubuntu-latest
     container:
+      # IMPORTANT: Ensure this container image has: bash, find, xargs, split (GNU version preferred for --numeric-suffixes), jq
       image: ghcr.io/pcoder7/spider-puredns-actions:latest
       credentials:
-        username: pcoder7
+        username: ${{ github.actor }}
         password: ${{ secrets.GHCR_TOKEN }}
-    strategy:
-      fail-fast: false
-      max-parallel: 20
-      matrix:
-        pair: ${{ fromJson(github.event.inputs.secondary_matrix_json && github.event.inputs.secondary_matrix_json || '[]') }}
+    outputs:
+      matrix: ${{ steps.set_matrix_output.outputs.matrix }}
     steps:
-
-          
-      - name: Display Trigger Payload (Debug)
-        run: |
-          echo "SECONDARY WORKER: Received payload:"
-          echo "${{ toJson(github.event.inputs) }}"
-          echo "---"
-          echo "SECONDARY WORKER: My assigned matrix for this job instance:"
-          echo "${{ toJson(matrix.pair) }}"
-
-      - name: Checkout repository (Account 2's repo)
+      - name: Checkout repository
         uses: actions/checkout@v3
+        # with:
+          # fetch-depth: 0 # Usually not needed unless 'find' relies on full git history, which is rare.
 
-      - name: Download Full Chunks Package from Primary Account
-        env:
-          GH_TOKEN_PRIMARY_ACCOUNT_READ: ${{ secrets.PAT_FOR_PRIMARY_ACCOUNT_ARTIFACTS_READ }}
-          PRIMARY_REPO_OWNER: ${{ github.event.inputs.primary_repo_owner }}
-          PRIMARY_REPO_NAME: ${{ github.event.inputs.primary_repo_name }}
-          PRIMARY_RUN_ID: ${{ github.event.inputs.primary_run_id }}
-          ARTIFACT_NAME_FROM_PRIMARY: ${{ github.event.inputs.chunk_package_artifact_name }}
+      - name: DEBUG - Verify Tools and Initial File System State
         shell: bash
         run: |
-          echo "SECONDARY WORKER: Downloading artifact '$ARTIFACT_NAME_FROM_PRIMARY' from $PRIMARY_REPO_OWNER/$PRIMARY_REPO_NAME, run ID $PRIMARY_RUN_ID"
-          if ! command -v gh &> /dev/null; then
-            echo "INFO: gh CLI not found. Installing..."
-            apt-get update -qy
-            apt-get install -qy curl
-            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-            chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-            apt-get update -qy
-            apt-get install -qy gh
-            if ! command -v gh &> /dev/null; then
-              echo "ERROR: gh CLI installation failed."
-              exit 1
-            fi
-          fi
-
-          echo "$GH_TOKEN_PRIMARY_ACCOUNT_READ" | gh auth login --with-token
-          FULL_PRIMARY_REPO="$PRIMARY_REPO_OWNER/$PRIMARY_REPO_NAME"
-          gh run download "$PRIMARY_RUN_ID" -R "$FULL_PRIMARY_REPO" -n "$ARTIFACT_NAME_FROM_PRIMARY" --dir .
-
-          PACKAGE_FILENAME="$ARTIFACT_NAME_FROM_PRIMARY.tar.gz"
-          if [ ! -f "$PACKAGE_FILENAME" ]; then
-            echo "ERROR: Failed to download '$PACKAGE_FILENAME'."
+          echo "DEBUG: Current directory: $(pwd)"
+          echo "DEBUG: Listing all files in repository root and subdirectories:"
+          find . -print
+          echo "-----------------------------------------------------"
+          echo "DEBUG: Specifically looking for majestic_million.txt  files:"
+          wget https://raw.githubusercontent.com/hadriansecurity/sanicdns/main/majestic_million.txt
+          find . -type f -name 'majestic_million.txt ' -print || echo "DEBUG: 'find' for majestic_million.txt  failed or found nothing."
+          echo "-----------------------------------------------------"
+          echo "DEBUG: Checking for 'jq' command..."
+          if ! command -v jq &> /dev/null; then
+            echo "CRITICAL_ERROR: 'jq' command not found. This is essential. Aborting."
             exit 1
-          fi
-          echo "Downloaded '$PACKAGE_FILENAME'."
-    
-       
-      - name: Extract Chunks and Resolvers for Secondary
-        shell: bash
-        run: |
-          PACKAGE_FILENAME="${{ github.event.inputs.chunk_package_artifact_name }}.tar.gz"
-          echo "SECONDARY WORKER: Extracting $PACKAGE_FILENAME..."
-          tar -xzvf "$PACKAGE_FILENAME"
-          if [ ! -d "chunks" ] || [ ! -f "resolvers.txt" ]; then
-            echo "ERROR: 'chunks/' or 'resolvers.txt' missing after extraction."
-            exit 1
-          fi
-          echo "Extraction complete."
-          ls -R chunks/
-          ls resolvers.txt resolvers-trusted.txt
-      
-      - name: Set up Go & install httpx + dsieve
-        uses: actions/setup-go@v4
-        with:
-          go-version: '1.23'
-     
-      - name: Install httpx and dsieve
-        run: |
-          if command -v dsieve &> /dev/null; then
-            echo "dsieve is already installed"
           else
-            echo "Installing dsieve..."
-            go install github.com/trickest/dsieve@latest
+            echo "DEBUG: jq version: $(jq --version)"
           fi
-
-      - name: Run httpx + pre-dsieve on subdomains + final filtering
+          echo "-----------------------------------------------------"
+          echo "DEBUG: Checking for 'split' command..."
+          if ! command -v split &> /dev/null; then
+            echo "CRITICAL_ERROR: 'split' command not found. This is essential. Aborting."
+            exit 1
+          else
+            echo "DEBUG: split version information (if available):"
+            split --version || echo "DEBUG: Could not get split version."
+          fi
+          echo "-----------------------------------------------------"
+      - name: Split into chunks & build matrix file
+        id: build_matrix_file
         shell: bash
         run: |
-          DOMAIN=${{ matrix.pair.domain }}
-          CHUNK_FILE_PATH=${{ matrix.pair.chunk }}
-          echo "SECONDARY WORKER: Processing domain '$DOMAIN' with chunk '$CHUNK_FILE_PATH'..."
-
-          if [ ! -f "$CHUNK_FILE_PATH" ]; then
-            echo "ERROR: Chunk file '$CHUNK_FILE_PATH' not found!"
-            exit 1
+          # Uncomment for extreme debugging:
+          # set -x 
+          
+          JSON_MATRIX='[]'
+          echo "INFO: Initializing matrix as: $JSON_MATRIX"
+          
+          echo "INFO: Locating majestic_million.txt  files..."
+          
+          # Using a temporary file for 'find' results for robustness with special filenames
+          # find . -type f -name "majestic_million.txt " -print0 > found_files.tmp
+           
+          # cat majestic_million.txt > found_files.tmp
+          find . -type f -name "majestic_million.txt" -print0 > found_files.tmp
+          
+          files=()
+          while IFS= read -r -d $'\0' file_path_from_find; do
+            # Ensure the file path is relative to the current directory for consistency
+            # This also handles if find returns './path/to/file'
+            standardized_file_path=$(echo "$file_path_from_find" | sed 's|^\./||')
+            files+=("$standardized_file_path")
+          done < found_files.tmp
+          rm found_files.tmp
+          if [ "${#files[@]}" -eq 0 ]; then
+            # echo "WARNING: No 'majestic_million.txt ' files found using 'find . -type f -name \"majestic_million.txt \"'."
+            
+             echo "WARNING: No 'majestic_million.txt' files found using 'find . -type f -name \"majestic_million.txt\"'."
+            echo "INFO: Matrix will remain '[]'."
+          else
+            echo "INFO: Found ${#files[@]} 'majestic_million.txt ' file(s):"
+            printf "  => '%s'\n" "${files[@]}"
+            for file_path in "${files[@]}"; do
+              echo "-----------------------------------------------------"
+              echo "INFO: Processing file: '$file_path'"
+              
+              domain_dir=$(dirname "$file_path")
+              # If file is in root, dirname is '.', use a default or filename
+              if [ "$domain_dir" == "." ]; then
+                domain=$(basename "$file_path" .txt) # e.g. subdomains if file is majestic_million.txt  in root
+              else
+                domain=$(basename "$domain_dir")
+              fi
+              echo "INFO: Deduced domain: '$domain'"
+              if [ ! -f "$file_path" ]; then
+                echo "ERROR: File '$file_path' reported by find, but not found during iteration. Skipping."
+                continue
+              fi
+              if [ ! -s "$file_path" ]; then # Check if file exists AND is not empty
+                echo "WARNING: File '$file_path' is empty. Skipping splitting for this file."
+                continue
+              fi
+              echo "INFO: Content preview of '$file_path' (first 3 lines):"
+              head -n 3 "$file_path"
+              echo "-------------------"
+              mkdir -p "chunks/$domain"
+              output_chunk_prefix="chunks/$domain/chunk_"
+              echo "INFO: Splitting '$file_path' into chunks in 'chunks/$domain/' with prefix '$output_chunk_prefix' (max $LINES_PER_CHUNK lines/chunk)"
+              
+              split -l "$LINES_PER_CHUNK" -a 3 --numeric-suffixes=1 "$file_path" "$output_chunk_prefix"
+              split_exit_code=$?
+              if [ $split_exit_code -ne 0 ]; then
+                echo "ERROR: 'split' command failed with exit code $split_exit_code for file '$file_path'. Skipping chunks for this file."
+                continue 
+              fi
+              
+              # Use a subshell for nullglob to keep its scope local
+              CHUNK_FILES_FOUND_FOR_DOMAIN=0
+              while IFS= read -r chunk_file; do
+                if [ -z "$chunk_file" ]; then continue; fi # Skip empty lines if any
+                CHUNK_FILES_FOUND_FOR_DOMAIN=$((CHUNK_FILES_FOUND_FOR_DOMAIN + 1))
+                echo "DEBUG: Found chunk: '$chunk_file' for domain '$domain'"
+                
+                # Ensure jq appends correctly
+                TEMP_JSON_MATRIX=$(printf '%s' "$JSON_MATRIX" | jq -c --arg d "$domain" --arg c "$chunk_file" '. + [{domain:$d,chunk:$c}]')
+                jq_exit_code=$?
+                if [ $jq_exit_code -ne 0 ]; then
+                  echo "ERROR: jq command failed (exit code $jq_exit_code) when trying to add chunk '$chunk_file'."
+                  echo "ERROR: Current JSON_MATRIX was: $JSON_MATRIX"
+                  echo "ERROR: Arguments to jq were: domain='$domain', chunk='$chunk_file'"
+                  # Decide: skip this chunk or abort? For now, skipping.
+                elif [ -z "$TEMP_JSON_MATRIX" ]; then
+                  echo "ERROR: jq command produced empty output for chunk '$chunk_file'. This should not happen with '. + [...]'."
+                  echo "ERROR: Current JSON_MATRIX was: $JSON_MATRIX"
+                else
+                  JSON_MATRIX="$TEMP_JSON_MATRIX"
+                  # echo "DEBUG: JSON_MATRIX updated to (first 100 chars): $(echo "$JSON_MATRIX" | head -c 100)"
+                fi
+              done < <(find "chunks/$domain/" -name 'chunk_*' -type f -print) # More robust way to list chunks
+              if [ "$CHUNK_FILES_FOUND_FOR_DOMAIN" -eq 0 ]; then
+                echo "WARNING: No chunk files (e.g., chunk_001) found in 'chunks/$domain/' after splitting '$file_path'. Original file might be smaller than $LINES_PER_CHUNK lines or 'split' created no files."
+              else
+                echo "INFO: Processed $CHUNK_FILES_FOUND_FOR_DOMAIN chunk(s) for domain '$domain'."
+              fi
+            done
           fi
-
-          # Step A: pre-dsieve on raw subdomain chunk
-          echo "-> Generating parent_domains.txt from raw subdomains..."
-          dsieve -if "$CHUNK_FILE_PATH" -f 2 | sort -u > parent_domains.txt
-          echo "  Parent count: $(wc -l < parent_domains.txt)"
-          head -n 5 parent_domains.txt || true
-
-          # Step B: Probe with httpx
-          HTTPX_OUT="httpx_output.txt"
-          echo "-> Running httpx (100 threads) against '$CHUNK_FILE_PATH'..."
-          httpx \
-            -l "$CHUNK_FILE_PATH" \
-            -threads 200 \
-            -silent \
-            -no-color \
-            -o "$HTTPX_OUT"
-          if [ ! -s "$HTTPX_OUT" ]; then
-            echo "No live URLs found. Exiting."
-            exit 0
+          echo "-----------------------------------------------------"
+          echo "FINAL_BUILD_INFO: Final JSON_MATRIX state before writing to file (first 200 chars): $(echo "$JSON_MATRIX" | head -c 200)"
+          echo "FINAL_BUILD_INFO: Length of JSON_MATRIX: ${#JSON_MATRIX}"
+          echo "INFO: Writing matrix to matrix.json"
+          echo "$JSON_MATRIX" > matrix.json
+          
+          # Immediate verification of matrix.json
+          if [ ! -f matrix.json ]; then
+            echo "CRITICAL_ERROR: matrix.json was NOT created!"
+            echo "INFO: Forcing matrix.json to be '[]' as a fallback."
+            echo "[]" > matrix.json
+          elif [ ! -s matrix.json ]; then
+            echo "CRITICAL_ERROR: matrix.json IS EMPTY after writing JSON_MATRIX which was: $JSON_MATRIX"
+            echo "INFO: Forcing matrix.json to be '[]' as a fallback."
+            echo "[]" > matrix.json
+          else
+            echo "VERIFY: matrix.json created. Size: $(wc -c < matrix.json) bytes. Content (first 200 chars): $(head -c 200 matrix.json)"
           fi
-
-          # Step C: Extract host:port for debugging
-          cut -d'/' -f3 "$HTTPX_OUT" > hosts_with_port.txt
-          echo "  Sample hosts_with_port.txt:"
-          head -n 5 hosts_with_port.txt || true
-
-          # Step D: Filter per parent domain
-          OUTPUT_ROOT="results"
-          mkdir -p "$OUTPUT_ROOT"
-          while read -r parent; do
-            mkdir -p "$OUTPUT_ROOT/$parent"
-            awk -v b="$parent" -F'/' '
-              {
-                host = $3
-                sub(/:.*/, "", host)
-                if (host == b || host ~ ("\\." b "$")) {
-                  print $0
-                }
-              }
-            ' "$HTTPX_OUT" > "$OUTPUT_ROOT/$parent/httpx_result.txt"
-          done < parent_domains.txt
-          echo "-> Split complete for domain '$DOMAIN'."
-          mkdir -p results
-      
-      - name: Compute SAFE_CHUNK (no slashes)
+          # set +x # if set -x was uncommented
+          
+      - name: Set matrix output
+        id: set_matrix_output
+        shell: bash
         run: |
-          SAFE_CHUNK="${{ matrix.pair.chunk }}"
-          SAFE_CHUNK="$(echo "$SAFE_CHUNK" | tr '/' '_')"
-          echo "SAFE_CHUNK=$SAFE_CHUNK" >> $GITHUB_ENV              
-
-      - name: Upload Secondary Account httpx+dsieve Results (as artifact)
+          # set -x # Uncomment for debugging this specific step
+          echo "INFO: Starting 'Set matrix output' step."
+          OUTPUT_VALUE_FOR_GITHUB="[]" # Default to a valid empty JSON array string
+          if [ -f matrix.json ]; then
+            echo "INFO: matrix.json found."
+            if [ -s matrix.json ]; then # File exists and is not empty
+              echo "INFO: matrix.json is not empty. Validating and compacting with jq..."
+              # Ensure the content is valid JSON and compact it.
+              # head -c 1M matrix.json: Safety measure for very large matrix.json, though unlikely here.
+              CANDIDATE_MATRIX_CONTENT=$(jq -c . < matrix.json) 
+              JQ_EXIT_CODE=$?
+              if [ $JQ_EXIT_CODE -eq 0 ] && [ -n "$CANDIDATE_MATRIX_CONTENT" ]; then
+                # Check for newlines again, jq -c should prevent this for valid JSON.
+                if [[ "$CANDIDATE_MATRIX_CONTENT" == *$'\n'* ]]; then
+                  echo "CRITICAL_ERROR: Compacted matrix content from jq STILL contains newlines. This is unexpected and will break GITHUB_OUTPUT."
+                  echo "DUMP: CANDIDATE_MATRIX_CONTENT was:"
+                  echo "$CANDIDATE_MATRIX_CONTENT"
+                  echo "ERROR: Defaulting output to '[]' due to newline issue."
+                  # OUTPUT_VALUE_FOR_GITHUB remains "[]"
+                else
+                  echo "INFO: jq validation/compaction successful. Setting this as the output value."
+                  OUTPUT_VALUE_FOR_GITHUB="$CANDIDATE_MATRIX_CONTENT"
+                fi
+              else
+                echo "ERROR: jq validation/compaction of matrix.json failed (exit code $JQ_EXIT_CODE) or produced empty output."
+                echo "ERROR: Content of matrix.json was (first 500 chars):"
+                head -c 500 matrix.json
+                echo "ERROR: Defaulting output to '[]'."
+                # OUTPUT_VALUE_FOR_GITHUB remains "[]"
+              fi
+            else
+              echo "WARNING: matrix.json exists but is empty. Defaulting output to '[]'."
+              # OUTPUT_VALUE_FOR_GITHUB remains "[]"
+            fi
+          else
+            echo "WARNING: matrix.json does NOT exist. Defaulting output to '[]'."
+            # OUTPUT_VALUE_FOR_GITHUB remains "[]"
+          fi
+          
+          echo "FINAL_OUTPUT_DECISION: The value to be set for 'matrix' output is (first 200 chars): $(echo "$OUTPUT_VALUE_FOR_GITHUB" | head -c 200)"
+          echo "FINAL_OUTPUT_DECISION: Length of value: ${#OUTPUT_VALUE_FOR_GITHUB}"
+          echo "matrix=$OUTPUT_VALUE_FOR_GITHUB" >> "$GITHUB_OUTPUT"
+          echo "INFO: Attempted to write to GITHUB_OUTPUT. Check action summary for actual output set."
+          # set +x # if set -x was uncommented
+          
+      - name: Upload chunks and resolvers
+        # Only upload if the matrix implies work to be done.
+        if: steps.set_matrix_output.outputs.matrix != '[]'
         uses: actions/upload-artifact@v4
         with:
-          name: secondary_httpx_dsieve_${{ matrix.pair.domain }}_${{ env.SAFE_CHUNK }}
-          path: results/
-          retention-days: 1
+          name: puredns-chunks
+          path: |
+            chunks
+            resolvers.txt # Ensure resolvers.txt exists in the repo or is created before this
+          retention-days: 1         
 
-  commit_all_secondary_results:
-    name: Commit All Secondary Results
-    needs: process_assigned_chunks_secondary
-    if: always()
+  resolve:
+    name: Split & resolve subdomains
+    needs: prepare_matrix
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/pcoder7/spider-puredns-actions:latest
-      credentials:
-        username: pcoder7
-        password: ${{ secrets.GHCR_TOKEN }}    
-    steps:
-      - name: Checkout repository (Account 2's repo)
-        uses: actions/checkout@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      TERM: xterm       
+    #container:
+     # image: ghcr.io/pcoder7/spider-puredns-actions:latest
+      #credentials:
+       # username: ${{ github.actor }}
+        #password: ${{ secrets.GHCR_TOKEN }}
+    strategy:
+      max-parallel: 20    
+      matrix:
+        pair: ${{ fromJson(needs.prepare_matrix.outputs.matrix) }}
 
-      - name: Download all 'secondary_httpx_dsieve_*' artifacts from this workflow run
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Download chunks + resolvers
         uses: actions/download-artifact@v4
         with:
-          pattern: secondary_httpx_dsieve_*
-          path: temp_results
-
-      - name: Organize and Commit Results
+          name: puredns-chunks
+          
+      - name: Download resolvers.txt + resolvers-trusted
+        run: |
+          wget -q -O spider-resolvers.txt https://raw.githubusercontent.com/rix4uni/resolvers/refs/heads/main/resolvers.txt
+          echo "spider-resolvers.txt downloaded "
+          echo " ------------------------------- "
+          echo " Now downloading spider-resolvers-trusted.txt "
+          wget -q -O spider-resolvers-trusted.txt https://raw.githubusercontent.com/and0x00/resolvers.txt/refs/heads/main/resolvers.txt
+      
+      - name: Install system dependencies
         shell: bash
         run: |
-          echo "Organizing downloaded results..."
-          mkdir -p results
-
-          # Find every httpx_result.txt inside each downloaded artifact and copy to ./results/<parent>/
-          mkdir -p results
-          find temp_results -type f -name "httpx_result.txt" | while read -r filepath; do
-            parent="$(basename "$(dirname "$filepath")")"
-            mkdir -p "results/$parent"
-            cat "$filepath" | anew -q "results/$parent/httpx_result.txt"
-          done || true
-
-          git config --global user.name "Account2 PureDNS Bot"
-          git config --global user.email "actions-bot@users.noreply.github.com"
-
-          if [ -d "results" ] && [ "$(ls -A results)" ]; then
-            git add results/
-            if ! git diff --staged --quiet; then
-              echo "Committing results..."
-              git commit -m "Add/Update httpx+dsieve results from Secondary Account (Run: ${{ github.event.inputs.primary_run_id || github.run_id }})"
-              git push
-            else
-              echo "No new changes in 'results/' to commit."
-            fi
-          else
-            echo "Results directory is empty or missing. Nothing to commit."
-          fi
+          curl -sSL https://raw.githubusercontent.com/hadriansecurity/sanicdns/main/install.sh | sudo bash
+     
+      - name: Install ethtool & shrink NIC queues
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ethtool
+          sudo apt-get install jq
+          # If eth0 doesn’t exist, adjust the interface name accordingly
+          sudo ethtool -L eth0 combined 3 || true          
+      
+      - name: Allocate hugepages (1 GB)
+        run: |
+          # best-effort; if dpdk-hugepages.py isn't on PATH this will fail harmlessly
+          sudo dpdk-hugepages.py --setup 2G || true
+      
+      - name: Verify installation
+        run: |
+          which sanicdns        
+  
+      - name: Resolve chunk via PureDNS
+        id: run_resolve
+        shell: bash
+        run: |
+          export TERM=xterm  
+          DOMAIN=${{ matrix.pair.domain }}
+          CHUNK=${{ matrix.pair.chunk }}
+          OUT_DIR="results/$DOMAIN"
+          mkdir -p "$OUT_DIR"
+          CHUNK_BASENAME=$(basename "$CHUNK")
+          OUT_FILE="$OUT_DIR/resolved_${CHUNK_BASENAME}"
+          #WILDCARD_FILE=""$OUT_DIR/wildcard_${CHUNK_BASENAME}""
+          LOG_FILE=""$OUT_DIR/wildcard_${CHUNK_BASENAME}""
+          echo "Resolving chunk '$CHUNK' for domain '$DOMAIN'..."
+          #puredns resolve "$CHUNK" -r resolvers.txt --resolvers-trusted resolvers-trusted.txt -q --write "$OUT_FILE" --write-wildcards "$WILDCARD_FILE" --wildcard-batch 100000 --wildcard-tests 500
+          sudo sanicdns \
+            -i "$CHUNK" \
+            -r 5000 \
+            -c 15000 \
+            -l $LOG_FILE \
+            --resolvers spider-resolvers-trusted.txt \
+            -o "$OUT_FILE" \
+            -w 4 \
+            --num-retries 10 \
+            --timeout 3000 
+          # Export basename for artifact naming
+          echo " ----- Count Resolved Domains----- "
+          cat "$OUT_FILE" | jq -r 'select(.data.answers | any(.type == "A")) |  .name | rtrimstr(".")' | sort -u |wc -l
+          echo "CHUNK_BASENAME=$CHUNK_BASENAME" >> $GITHUB_ENV 
+          
+          
+      - name: Upload resolved results
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved_${{ matrix.pair.domain }}_${{ env.CHUNK_BASENAME }}
+          path: results/${{ matrix.pair.domain }}/resolved_${{ env.CHUNK_BASENAME }}
+          retention-days: 1
