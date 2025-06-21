@@ -1,3 +1,5 @@
+name: Parallel PureDNS Split & Resolve
+
 on:
   workflow_dispatch:
 
@@ -264,18 +266,37 @@ jobs:
           echo " Now downloading spider-resolvers-trusted.txt "
           wget -q -O spider-resolvers-trusted.txt https://raw.githubusercontent.com/and0x00/resolvers.txt/refs/heads/main/resolvers.txt
       
-      - name: Install system dependencies
-        shell: bash
+      - name: Install pre‑reqs
+        run: | 
+          sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Install sanicdns
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          curl -sSL https://raw.githubusercontent.com/hadriansecurity/sanicdns/main/install.sh | sudo bash
+          # make sure the script is executable
+          chmod +x scripts/install-sanicdns.sh
+          # run the installer
+          scripts/install-sanicdns.sh
      
       - name: Install ethtool & shrink NIC queues
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ethtool
-          sudo apt-get install jq
-          # If eth0 doesn’t exist, adjust the interface name accordingly
-          sudo ethtool -L eth0 combined 3 || true          
+          sudo apt-get update -qq
+          for i in {1..3}; do
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq ethtool && break
+            echo "apt install failed, retrying in 10s…" >&2
+            sleep 10
+          done
+      
+      - name: Resize NIC RSS queues
+        run: |
+          IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
+          if [ -n "$IFACE" ]; then
+            echo "🔧 Resizing RSS queues on $IFACE to 3..."
+            sudo ethtool -L "$IFACE" combined 3 || true
+          else
+            echo "⚠️  No default interface detected; skipping RSS resize."
+          fi
       
       - name: Allocate hugepages (1 GB)
         run: |
@@ -304,13 +325,15 @@ jobs:
           sudo sanicdns \
             -i "$CHUNK" \
             -r 5000 \
-            -c 15000 \
+            -c 20000 \
             -l $LOG_FILE \
             --resolvers spider-resolvers-trusted.txt \
             -o "$OUT_FILE" \
             -w 4 \
-            --num-retries 10 \
-            --timeout 3000 
+            --num-retries 3 \
+            --timeout 30000 
+
+          # To suppress output use > /dev/null 2>&1  
           # Export basename for artifact naming
           echo " ----- Count Resolved Domains----- "
           cat "$OUT_FILE" | jq -r 'select(.data.answers | any(.type == "A")) |  .name | rtrimstr(".")' | sort -u |wc -l
