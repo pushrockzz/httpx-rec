@@ -325,13 +325,13 @@ jobs:
           sudo sanicdns \
             -i "$CHUNK" \
             -r 1000 \
-            -c 7000 \
+            -c 10000 \
             -l $LOG_FILE \
             --resolvers spider-resolvers-trusted.txt \
             -o "$OUT_FILE" \
             -w 4 \
-            --num-retries 10 \
-            --timeout 10000 
+            --num-retries 20 \
+            --timeout 20000 
 
           # To suppress output use > /dev/null 2>&1  
           # Export basename for artifact naming
