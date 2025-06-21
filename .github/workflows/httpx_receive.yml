@@ -324,14 +324,14 @@ jobs:
           #puredns resolve "$CHUNK" -r resolvers.txt --resolvers-trusted resolvers-trusted.txt -q --write "$OUT_FILE" --write-wildcards "$WILDCARD_FILE" --wildcard-batch 100000 --wildcard-tests 500
           sudo sanicdns \
             -i "$CHUNK" \
-            -r 2000 \
-            -c 5000 \
+            -r 1000 \
+            -c 7000 \
             -l $LOG_FILE \
             --resolvers spider-resolvers-trusted.txt \
             -o "$OUT_FILE" \
             -w 4 \
-            --num-retries 15 \
-            --timeout 15000 
+            --num-retries 10 \
+            --timeout 10000 
 
           # To suppress output use > /dev/null 2>&1  
           # Export basename for artifact naming
