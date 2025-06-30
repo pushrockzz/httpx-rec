@@ -35,7 +35,7 @@ jobs:
       # Use the exact same container for consistency with the primary account
       image: ghcr.io/pcoder7/spider-puredns-actions:latest
       credentials:
-        username: ${{ github.actor }}
+        username: ${{ secrets.GHCR_USER }}
         password: ${{ secrets.GHCR_TOKEN }}
     strategy:
       fail-fast: false
