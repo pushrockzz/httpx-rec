@@ -260,7 +260,9 @@ jobs:
         env:
           SOURCE_DIR: final-merged-results
           STORE: ${{ secrets.STORE }}
-          PAT_FOR_STORE_REPO: ${{ secrets.PAT_FOR_STORE_REPO }}
+          PAT_FOR_STORE_REPO: ${{ secrets.PAT_FOR_STORE_REPO }}]
+          CORRELATION_ID: ${{ github.event.inputs.primary_run_id }}
+        
         run: |
           cd store-recon
           git config --global user.name "GitHub Actions Bot (Secondary)"
@@ -283,7 +285,8 @@ jobs:
             if [ "$MERGE_PERFORMED" = false ]; then exit 0; fi
             if git diff --quiet --exit-code; then echo "✅ No new unique data to commit."; exit 0; fi
             git add results/
-            git commit -m "feat(recon): Automated results from Secondary Account" -m "Update httpx results from primary workflow run ${{ github.event.inputs.primary_run_id }}."
+            git commit -m "feat(recon): Automated http-multiple results from Correlation ID: ${CORRELATION_ID}"
+            
             if git push -v origin main; then echo "✅ Push successful!"; exit 0; fi
             git reset --hard origin/main
             sleep $((RANDOM % 5 + 2))
