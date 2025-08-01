@@ -135,6 +135,9 @@ jobs:
           httpx \
             -l "$CHUNK_FILE_PATH" \
             -threads 100 \
+            -sc -cl -vhost -fhr \
+            -retries 2 -timeout 30 \
+            -delay 100ms \
             -silent \
             -no-color \
             -o "$HTTPX_OUT"
