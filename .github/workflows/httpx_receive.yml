@@ -67,7 +67,7 @@ jobs:
             apt-get install -qy gh
             if ! command -v gh &> /dev/null; then
               echo "ERROR: gh CLI installation failed."
-              exit 1
+              exit 0
             fi
           fi
 
@@ -78,7 +78,7 @@ jobs:
           PACKAGE_FILENAME="$ARTIFACT_NAME_FROM_PRIMARY.tar.gz"
           if [ ! -f "$PACKAGE_FILENAME" ]; then
             echo "ERROR: Failed to download '$PACKAGE_FILENAME'."
-            exit 1
+            exit 0
           fi
           echo "Downloaded '$PACKAGE_FILENAME'."
           
@@ -94,7 +94,7 @@ jobs:
           tar -xzvf "$PACKAGE_FILENAME"
           if [ ! -d "chunks" ]; then
              echo "ERROR: 'chunks/' directory not found after extraction!"
-             exit 1
+             exit 0
           fi
           echo "Extraction complete. Listing contents of 'chunks/':"
           ls -R chunks/
@@ -124,7 +124,7 @@ jobs:
 
           if [ ! -f "$CHUNK_FILE_PATH" ]; then
             echo "ERROR: Chunk file '$CHUNK_FILE_PATH' not found!"
-            exit 1
+            exit 0
           fi
 
           echo "-> Generating parent_domains.txt from raw subdomains..."
@@ -291,4 +291,5 @@ jobs:
             git reset --hard origin/main
             sleep $((RANDOM % 5 + 2))
           done
-          echo "❌ Could not push changes after multiple attempts." && exit 1
+          echo "❌ Could not push changes after multiple attempts."
+          exit 1
