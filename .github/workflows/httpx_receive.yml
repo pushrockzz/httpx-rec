@@ -312,7 +312,7 @@ jobs:
             fi
             
             echo "-> Staging and committing changes..."
-            git commit -m "feat(recon): Automated http-multiple results from Correlation ID: ${CORRELATION_ID}"
+            git commit -m "feat: Automated http-multiple results from Correlation ID: ${CORRELATION_ID}"
             
             echo "-> Attempting to push..."
             if git push -v origin main; then
