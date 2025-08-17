@@ -243,7 +243,6 @@ jobs:
       - name: Download Merged Secondary Results Artifact
         uses: actions/download-artifact@v4
         with:
-          # CHANGED: Downloads the specific merged artifact from this workflow's 'merge_results' job.
           name: secondary-httpx-dsieve-merged-results
           path: final-merged-results/
 
@@ -251,45 +250,80 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ secrets.STORE_OWNER }}/${{ secrets.STORE }}
-          token: ${{ secrets.PAT_FOR_STORE_REPO }} # Using a generic secret name
+          token: ${{ secrets.PAT_FOR_STORE_REPO }}
           path: store-recon
 
       - name: Synchronize and Push with Retry
-        # This script is identical to the primary one. It is designed to handle race conditions
-        # from multiple workflows trying to commit at the same time.
         env:
           SOURCE_DIR: final-merged-results
           STORE: ${{ secrets.STORE }}
-          PAT_FOR_STORE_REPO: ${{ secrets.PAT_FOR_STORE_REPO }}]
+          PAT_FOR_STORE_REPO: ${{ secrets.PAT_FOR_STORE_REPO }}
           CORRELATION_ID: ${{ github.event.inputs.primary_run_id }}
         
         run: |
           cd store-recon
+          echo "Configuring git user..."
           git config --global user.name "GitHub Actions Bot (Secondary)"
           git config --global user.email "github-actions-bot@users.noreply.github.com"
+
           for attempt in {1..5}; do
             echo "[Attempt ${attempt}]"
+            
+            echo "-> Pulling latest changes from origin/main..."
             git pull --rebase origin main
+            
+            echo "-> Running smart merge against the latest version..."
             MERGE_PERFORMED=false
             for domain_dir in "../$SOURCE_DIR"/*; do
               if [ -d "$domain_dir" ]; then
                 domain_name=$(basename "$domain_dir")
                 source_file="$domain_dir/httpx_result.txt"
                 dest_file="results/$domain_name/httpx_result.txt"
+                
+                if [ ! -f "$source_file" ]; then
+                  echo "  -> INFO: Source file '$source_file' not found. Skipping."
+                  continue
+                fi
+                
+                # --- FIX: Sanitize the file to remove NULL characters ---
+                echo "  -> Sanitizing '$source_file'..."
+                tr -d '\0' < "$source_file" > "$source_file.tmp" && mv "$source_file.tmp" "$source_file"
+
+                echo "  -> Merging '$source_file' into '$dest_file'..."
                 mkdir -p "$(dirname "$dest_file")" && touch "$dest_file"
                 awk 'FNR==NR {data[$1]=$0; next} {data[$1]=$0} END {for (key in data) print data[key]}' "$dest_file" "$source_file" | sort -u > "${dest_file}.tmp"
                 mv "${dest_file}.tmp" "$dest_file"
                 MERGE_PERFORMED=true
               fi
             done
-            if [ "$MERGE_PERFORMED" = false ]; then exit 0; fi
-            if git diff --quiet --exit-code; then echo "✅ No new unique data to commit."; exit 0; fi
+
+            if [ "$MERGE_PERFORMED" = false ]; then
+                echo "No source files found in artifact to process. Exiting."
+                exit 0
+            fi
+
+            # Stage changes *before* checking for a diff.
             git add results/
+            
+            # Now check for staged changes.
+            if git diff --cached --quiet; then
+              echo "✅ No new unique data to commit. Repository is already up-to-date."
+              exit 0
+            fi
+            
+            echo "-> Staging and committing changes..."
             git commit -m "feat(recon): Automated http-multiple results from Correlation ID: ${CORRELATION_ID}"
             
-            if git push -v origin main; then echo "✅ Push successful!"; exit 0; fi
+            echo "-> Attempting to push..."
+            if git push -v origin main; then
+              echo "✅ Push successful on attempt ${attempt}!"
+              exit 0
+            fi
+            
+            echo "-> Push failed on attempt ${attempt}. Resetting local branch and retrying..."
             git reset --hard origin/main
             sleep $((RANDOM % 5 + 2))
           done
-          echo "❌ Could not push changes after multiple attempts."
-          exit 1
+
+          echo "❌ Could not push changes after 5 attempts. Failing workflow."
+          exit 0
