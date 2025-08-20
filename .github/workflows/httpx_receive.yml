@@ -262,7 +262,7 @@ jobs:
           STORE: ${{ secrets.STORE }}
           PAT_FOR_STORE_REPO: ${{ secrets.PAT_FOR_STORE_REPO }}
           CORRELATION_ID: ${{ github.event.inputs.primary_run_id }}
-          COMMIT_MESSAGE: "${{ github.event.inputs.commit_pattern }} ${{ github.event.inputs.correlation_id }}"
+          COMMIT_MESSAGE: ${{ github.event.inputs.commit_pattern }}
           
         run: |
           cd store-recon
@@ -316,7 +316,7 @@ jobs:
             fi
             
             echo "-> Staging and committing changes..."
-            git commit -m "$COMMIT_MESSAGE"
+            git commit -m "$COMMIT_MESSAGE" "$CORRELATION_ID"
             
             echo "-> Attempting to push..."
             if git push -v origin main; then
