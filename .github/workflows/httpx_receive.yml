@@ -265,69 +265,77 @@ jobs:
           COMMIT_MESSAGE: ${{ github.event.inputs.commit_pattern }}
           
         run: |
+          # No "set -e" to ensure the script is maximally resilient.
+          
           cd store-recon
           echo "Configuring git user..."
           git config --global user.name "GitHub Actions Bot (Secondary)"
           git config --global user.email "github-actions-bot@users.noreply.github.com"
 
-          for attempt in {1..5}; do
-            echo "[Attempt ${attempt}]"
-            
-            echo "-> Pulling latest changes from origin/main..."
-            git pull --rebase origin main
-            
-            echo "-> Running smart merge against the latest version..."
-            MERGE_PERFORMED=false
-            for domain_dir in "../$SOURCE_DIR"/*; do
-              if [ -d "$domain_dir" ]; then
-                domain_name=$(basename "$domain_dir")
-                source_file="$domain_dir/httpx_result.txt"
-                dest_file="results/$domain_name/httpx_result.txt"
-                
-                if [ ! -f "$source_file" ]; then
-                  echo "  -> INFO: Source file '$source_file' not found. Skipping."
-                  continue
-                fi
-                
-                # --- FIX: Sanitize the file to remove NULL characters ---
-                echo "  -> Sanitizing '$source_file'..."
-                tr -d '\0' < "$source_file" > "$source_file.tmp" && mv "$source_file.tmp" "$source_file"
+          # --- STEP 1: PULL and MERGE (Done ONCE) ---
+          echo "Pulling latest changes before merging..."
+          if ! git pull origin main; then
+            echo "::error:: Initial pull failed. Cannot proceed with merging."
+            exit 0
+          fi
+          
+          echo "Running smart merge..."
+          MERGE_PERFORMED=false
+          for domain_dir in "../$SOURCE_DIR"/*; do
+            if [ -d "$domain_dir" ]; then
+              domain_name=$(basename "$domain_dir")
+              source_file="$domain_dir/httpx_result.txt"
+              dest_file="results/$domain_name/httpx_result.txt"
+              
+              if [ ! -f "$source_file" ]; then continue; fi
+              
+              # Sanitize the source file to prevent binary commits.
+              tr -d '\0' < "$source_file" > "$source_file.tmp" && mv "$source_file.tmp" "$source_file"
 
-                echo "  -> Merging '$source_file' into '$dest_file'..."
-                mkdir -p "$(dirname "$dest_file")" && touch "$dest_file"
-                awk 'FNR==NR {data[$1]=$0; next} {data[$1]=$0} END {for (key in data) print data[key]}' "$dest_file" "$source_file" | sort -u > "${dest_file}.tmp"
-                mv "${dest_file}.tmp" "$dest_file"
-                MERGE_PERFORMED=true
-              fi
-            done
-
-            if [ "$MERGE_PERFORMED" = false ]; then
-                echo "No source files found in artifact to process. Exiting."
-                exit 0
+              mkdir -p "$(dirname "$dest_file")" && touch "$dest_file"
+              awk 'FNR==NR {data[$1]=$0; next} {data[$1]=$0} END {for (key in data) print data[key]}' "$dest_file" "$source_file" | sort -u > "${dest_file}.tmp"
+              mv "${dest_file}.tmp" "$dest_file"
+              MERGE_PERFORMED=true
             fi
+          done
 
-            # Stage changes *before* checking for a diff.
-            git add results/
-            
-            # Now check for staged changes.
-            if git diff --cached --quiet; then
-              echo "✅ No new unique data to commit. Repository is already up-to-date."
+          if [ "$MERGE_PERFORMED" = false ]; then
+              echo "No source files found in artifact to process. Exiting."
               exit 0
+          fi
+
+          # --- STEP 2: STAGE and COMMIT (Done ONCE) ---
+          git add results/
+          if git diff --cached --quiet; then
+            echo "✅ No new unique data to commit. Repository is already up-to-date."
+            exit 0
+          fi
+          
+          echo "Committing changes locally..."
+          git commit -m "$COMMIT_MESSAGE $CORRELATION_ID"
+
+          # --- STEP 3: LOOP to SYNC and PUSH ---
+          for attempt in {1..5}; do
+            echo "[Attempt ${attempt}] Synchronizing and pushing changes..."
+            
+            # If pull --rebase fails, reset and retry.
+            if ! git pull --rebase origin main; then
+                echo "::warning:: Pull --rebase failed on attempt ${attempt}. Resetting local state and retrying."
+                git reset --hard origin/main
+                sleep $((RANDOM % 5 + 2))
+                continue
             fi
-            
-            echo "-> Staging and committing changes..."
-            git commit -m "$COMMIT_MESSAGE $CORRELATION_ID"
-            
-            echo "-> Attempting to push..."
+
+            # Attempt to push the rebased commit.
             if git push -v origin main; then
               echo "✅ Push successful on attempt ${attempt}!"
               exit 0
             fi
-            
-            echo "-> Push failed on attempt ${attempt}. Resetting local branch and retrying..."
-            git reset --hard origin/main
+
+            echo "::warning:: Push failed on attempt ${attempt}. Retrying after a short delay..."
+            if [ "${attempt}" -eq 5 ]; then
+              echo "::error:: All 5 push attempts failed. The job will pass but the commit was NOT pushed."
+              exit 0 # Exit with success code.
+            fi
             sleep $((RANDOM % 5 + 2))
           done
-
-          echo "❌ Could not push changes after 5 attempts. Failing workflow."
-          exit 0
