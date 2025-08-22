@@ -16,7 +16,7 @@ on:
       primary_run_id:
         description: 'The run_id of the primary workflow to download artifacts from.'
         required: true
-      commit_message:
+      commit_pattern:
         description: 'The commit pattern of the primary workflow'
         required: true
       chunk_package_artifact_name:
