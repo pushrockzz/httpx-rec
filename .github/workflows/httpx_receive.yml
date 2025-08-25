@@ -117,8 +117,7 @@ jobs:
           fi
 
       - name: Run httpx + pre-dsieve on subdomains + final filtering
-        # This step is an exact copy of the logic from the primary account's workflow
-        # It uses the matrix context, which is now populated with the secondary chunks
+
         shell: bash
         run: |
           DOMAIN=${{ matrix.pair.domain }}
@@ -184,10 +183,10 @@ jobs:
           name: secondary_httpx_dsieve_${{ matrix.pair.domain }}_${{ env.SAFE_CHUNK }}
           path: results/
           retention-days: 1
+  
   merge_results:
     name: Merge All Secondary httpx Results
     runs-on: ubuntu-latest
-    # This job needs to run only after all the parallel 'resolve' jobs in THIS workflow are complete.
     needs: resolve_secondary_account_chunks
     if: always() # Ensures we merge results even if some runners failed.
     steps:
@@ -242,6 +241,7 @@ jobs:
     name: Create Commit in store-recon (Secondary)
     runs-on: ubuntu-latest
     needs: merge_results
+    if: always() && needs.merge_results.outputs.has_results == 'true'    
     steps:
       - name: Download Merged Secondary Results Artifact
         uses: actions/download-artifact@v4
@@ -262,10 +262,8 @@ jobs:
           STORE: ${{ secrets.STORE }}
           PAT_FOR_STORE_REPO: ${{ secrets.PAT_FOR_STORE_REPO }}
           CORRELATION_ID: ${{ github.event.inputs.primary_run_id }}
-          COMMIT_MESSAGE: ${{ github.event.inputs.commit_pattern }}
-          
+          COMMIT_MESSAGE: ${{ github.event.inputs.commit_pattern }}        
         run: |
-          # No "set -e" to ensure the script is maximally resilient.
           
           cd store-recon
           echo "Configuring git user..."
